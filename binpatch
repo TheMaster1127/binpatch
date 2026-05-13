@@ -21,31 +21,28 @@ import datetime
 import shutil
 import subprocess
 import re
+import struct
 
 def parse_hex(s):
-    """
-    Parses flexible hex strings into bytes.
-    Accepts: 'cb 10 00 00 05', 'cb10000005', '0xcb, 0x10', etc.
-    """
-    # Lowercase, remove '0x', replace commas with spaces
+    """Parses flexible hex strings into bytes."""
     s = s.lower().replace('0x', '').replace(',', ' ')
-    # Strip all whitespace to create a single contiguous hex string
     s = ''.join(s.split())
     if len(s) % 2 != 0:
-        raise ValueError("Hex string must have an even number of characters.")
+        raise ValueError("Hex string must have an even number of characters (e.g. '05' instead of '5').")
     return bytes.fromhex(s)
 
 def parse_offset(s):
-    """Parses offset strings, supporting decimal and 0x hex formats."""
-    s = s.strip()
-    if s.lower().startswith('0x'):
+    """Parses offset strings. ALWAYS treats input as Hexadecimal."""
+    s = s.strip().lower()
+    if s.startswith('0x'):
+        s = s[2:]
+    try:
         return int(s, 16)
-    return int(s)
+    except ValueError:
+        raise ValueError(f"Invalid hex offset: {s}")
 
 def print_hexdump(data, match_offset, match_len):
-    """
-    Prints an xxd-style hex dump highlighting the matched bytes with '^^'.
-    """
+    """Prints an xxd-style hex dump highlighting the matched bytes."""
     start_line = match_offset & ~0xF
     end_line = (match_offset + match_len - 1) & ~0xF
 
@@ -59,18 +56,15 @@ def print_hexdump(data, match_offset, match_len):
         for j, b in enumerate(chunk):
             curr = i + j
             hex_str += f"{b:02x} "
-            if j == 7: hex_str += " " # Middle gap
+            if j == 7: hex_str += " "
             
-            # Place carets under the matched bytes
             if match_offset <= curr < match_offset + match_len:
                 caret_str += "^^ "
             else:
                 caret_str += "   "
             if j == 7: caret_str += " "
 
-        # ASCII representation (dots for non-printable)
         ascii_str = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
-        
         print(f"{i:08x}: {hex_str:<49} |{ascii_str}|")
         if "^" in caret_str:
             print(f"          {caret_str}")
@@ -88,12 +82,8 @@ def find_exact(data, pat):
     return offsets
 
 def find_heuristic(data, pat):
-    """
-    Finds the largest contiguous substrings of the pattern in the data.
-    Generates lengths from len(pat) down to 1, searching all permutations.
-    """
+    """Finds the largest contiguous substrings of the pattern in the data."""
     matches = []
-    
     for length in range(len(pat), 0, -1):
         for start in range(len(pat) - length + 1):
             subpat = pat[start:start+length]
@@ -103,7 +93,6 @@ def find_heuristic(data, pat):
                 if idx == -1: 
                     break
                 
-                # Deduplication: Ensure this match isn't just a subset of a larger match we already found at this exact spot
                 covered = False
                 for (m_len, m_off, _) in matches:
                     if m_off <= idx <= m_off + m_len - length:
@@ -114,68 +103,169 @@ def find_heuristic(data, pat):
                     matches.append((length, idx, subpat))
                 idx += 1
 
-    # Sort: Largest length first, then by offset
     matches.sort(key=lambda x: (-x[0], x[1]))
-    
-    # Smart Filtering: Limit output to prevent terminal flooding
     if not matches: return []
-    
     top_len = matches[0][0]
-    # Only keep the top length and top length - 1 (ignores single-byte floods if we found big chunks)
     allowed_lengths = {top_len, top_len - 1} if top_len > 1 else {1}
-    filtered_matches = [m for m in matches if m[0] in allowed_lengths]
-    
-    return filtered_matches[:20] # Hard cap at 20 results to keep the terminal clean
+    return [m for m in matches if m[0] in allowed_lengths]
 
-def disassemble(filename, offset, size, quiet):
-    """Disassembles binary at offset using objdump."""
+def parse_elf_headers(filepath):
+    """Natively parses ELF binaries to map Virtual Addresses to File Offsets."""
+    try:
+        with open(filepath, 'rb') as f:
+            if f.read(4) != b'\x7fELF': return None
+            ei_class = f.read(1)[0]
+            ei_data = f.read(1)[0]
+            endian = '<' if ei_data == 1 else '>'
+            
+            f.seek(24)
+            if ei_class == 1:
+                e_entry = struct.unpack(endian + 'I', f.read(4))[0]
+                e_phoff = struct.unpack(endian + 'I', f.read(4))[0]
+                f.seek(42)
+                e_phentsize = struct.unpack(endian + 'H', f.read(2))[0]
+                e_phnum = struct.unpack(endian + 'H', f.read(2))[0]
+            elif ei_class == 2:
+                e_entry = struct.unpack(endian + 'Q', f.read(8))[0]
+                e_phoff = struct.unpack(endian + 'Q', f.read(8))[0]
+                f.seek(54)
+                e_phentsize = struct.unpack(endian + 'H', f.read(2))[0]
+                e_phnum = struct.unpack(endian + 'H', f.read(2))[0]
+            else: return None
+            
+            segments = []
+            entry_offset = None
+            
+            if e_phoff == 0: return None
+            
+            for i in range(e_phnum):
+                f.seek(e_phoff + i * e_phentsize)
+                if ei_class == 1:
+                    p_type = struct.unpack(endian + 'I', f.read(4))[0]
+                    p_offset = struct.unpack(endian + 'I', f.read(4))[0]
+                    p_vaddr = struct.unpack(endian + 'I', f.read(4))[0]
+                    f.read(4)
+                    p_filesz = struct.unpack(endian + 'I', f.read(4))[0]
+                    p_memsz = struct.unpack(endian + 'I', f.read(4))[0]
+                else:
+                    p_type = struct.unpack(endian + 'I', f.read(4))[0]
+                    p_flags = struct.unpack(endian + 'I', f.read(4))[0]
+                    p_offset = struct.unpack(endian + 'Q', f.read(8))[0]
+                    p_vaddr = struct.unpack(endian + 'Q', f.read(8))[0]
+                    f.read(8)
+                    p_filesz = struct.unpack(endian + 'Q', f.read(8))[0]
+                    p_memsz = struct.unpack(endian + 'Q', f.read(8))[0]
+                    
+                if p_type == 1: # PT_LOAD
+                    segments.append((p_offset, p_filesz, p_vaddr))
+                    if p_vaddr <= e_entry < p_vaddr + p_memsz:
+                        entry_offset = e_entry - p_vaddr + p_offset
+                        
+            return {'entry_offset': entry_offset, 'segments': segments}
+    except Exception:
+        return None
+
+def get_vaddr(elf_info, file_offset):
+    """Converts a file offset into a Virtual Address using ELF program headers."""
+    if not elf_info: return None
+    for p_offset, p_filesz, p_vaddr in elf_info['segments']:
+        if p_offset <= file_offset < p_offset + p_filesz:
+            return p_vaddr + (file_offset - p_offset)
+    return None
+
+def extract_instructions_from_output(output_lines, match_hex, size, until_return):
+    count = 0
+    started = False
+    extracted = []
+    
+    # Regex patterns for finding end of functions (x86, ARM, MIPS)
+    return_patterns = [
+        r'\bret[qnfz]?\b', r'\brepz\s+ret\b', 
+        r'\bbx\s+lr\b', r'\bpop\b[^}]*\bpc\b', 
+        r'\bjr\s+ra\b'
+    ]
+    
+    for line in output_lines:
+        if not started:
+            parts = line.strip().lower().split(':', 1)
+            if len(parts) >= 1 and ' ' not in parts[0]:
+                addr = parts[0].lstrip('0') or '0'
+                if addr == match_hex:
+                    started = True
+        
+        if started:
+            if line.strip() and not line.startswith('disassembly') and not line.endswith(':'):
+                extracted.append(line.rstrip())
+                count += 1
+                
+                if until_return:
+                    if any(re.search(pat, line.lower()) for pat in return_patterns):
+                        break
+                else:
+                    if count >= size:
+                        break
+    return extracted
+
+def disassemble(filename, offset, size, until_return, quiet):
+    """Disassembles binary at offset with raw fallback and Intel syntax."""
     if not shutil.which('objdump'):
         if not quiet: print("Error: 'objdump' not found on system. Cannot disassemble.", file=sys.stderr)
         sys.exit(1)
     
-    stop_addr = offset + (size * 15) # Safely overestimate stop address (x86 max instr is 15 bytes)
+    elf_info = parse_elf_headers(filename)
+    vaddr = get_vaddr(elf_info, offset)
     
-    # Standard attempt
-    cmd = ['objdump', '-d', f'--start-address={offset}', f'--stop-address={stop_addr}', filename]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # Calculate stopping points safely
+    overestimate_stop = offset + (size * 15) if not until_return else offset + 4096
     
-    # Fallback to raw binary mode if not an ELF/PE file
-    if res.returncode != 0 or 'file format not recognized' in res.stderr:
-        cmd = ['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', f'--start-address={offset}', f'--stop-address={stop_addr}', filename]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    extracted = []
 
-    lines = res.stdout.splitlines()
-    count = 0
-    started = False
-    offset_hex = f"{offset:x}"
-    
-    for line in lines:
-        if not started:
-            # Look for the exact offset marking the start of instructions, ignoring leading zeros
-            if re.search(r'\b0*' + re.escape(offset_hex) + r':', line.lower()):
-                started = True
+    # Attempt 1: Standard objdump (Uses VMA if mapped). Fails on section-less ELFs.
+    if vaddr is not None:
+        start_addr = vaddr
+        match_addr = f"{vaddr:x}"
+        cmd1 = ['objdump', '-D', '-M', 'intel', f'--start-address={start_addr}', filename]
+        if not until_return: cmd1.append(f'--stop-address={start_addr + (size * 15)}')
         
-        if started:
-            # Skip empty lines and headers
-            if line.strip() and not line.startswith('Disassembly') and not line.endswith(':'):
-                print(line)
-                count += 1
-                if count >= size:
-                    break
+        res1 = subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res1.returncode == 0:
+            extracted = extract_instructions_from_output(res1.stdout.splitlines(), match_addr, size, until_return)
+
+    # Attempt 2: Fallback to Raw Binary Mode (Ignores ELF headers, slices raw bytes directly)
+    if not extracted:
+        match_addr_raw = f"{offset:x}"
+        cmd2 = ['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', '-M', 'intel', f'--start-address={offset}', filename]
+        if not until_return: cmd2.append(f'--stop-address={overestimate_stop}')
+        
+        res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        extracted = extract_instructions_from_output(res2.stdout.splitlines(), match_addr_raw, size, until_return)
+        
+    if not extracted:
+        if not quiet: print(f"Failed to disassemble at offset {hex(offset)}. (No instructions found).")
+        return
+        
+    for line in extracted:
+        print(line)
 
 def main():
-    # We use add_help=False so we can map '-h' to '--hex' instead of '--help'
+    if len(sys.argv) == 1:
+        sys.argv.append('--help')
+
     parser = argparse.ArgumentParser(description="binpatch - Binary Patching Tool", add_help=False)
     parser.add_argument('file', help="Target file")
-    parser.add_argument('-o', '--offset', help="Offset in file (decimal or hex with 0x)")
+    parser.add_argument('-o', '--offset', help="Offset in file (decimal or hex)")
+    parser.add_argument('-e', '--entry', action='store_true', help="Target the ELF Entry Point automatically")
     parser.add_argument('-h', '--hex', help="Hex bytes to write (e.g., 'cb 10 00 00 05')")
     parser.add_argument('-b', '--backup', action='store_true', help="Create backup before patching")
     parser.add_argument('-f', '--find', help="Find exact hex pattern in file")
     parser.add_argument('-fh', '--find-heuristic', help="Find largest contiguous substring match")
-    parser.add_argument('-d', '--disassemble', action='store_true', help="Disassemble at offset (requires -o)")
-    parser.add_argument('-s', '--size', type=int, default=1, help="Number of instructions to disassemble (default: 1)")
+    parser.add_argument('-d', '--disassemble', action='store_true', help="Disassemble at target offset")
+    parser.add_argument('-s', '--size', type=int, default=None, help="Num instructions OR Num find results (Defaults: 1 for disasm, 5 for find)")
+    parser.add_argument('-r', '--return', action='store_true', dest='until_return', help="Disassemble until return instruction (ret, bx lr, etc.)")
+    parser.add_argument('-a', '--all', action='store_true', help="Show all find results (Overrides limit)")
     parser.add_argument('-q', '--quiet', action='store_true', help="Scripting mode: Output raw offsets only")
     parser.add_argument('--help', action='help', help="Show this help message and exit")
+    parser.add_argument('--version', action='version', version='binpatch 1.0.0')
     
     args = parser.parse_args()
     
@@ -183,9 +273,34 @@ def main():
         if not args.quiet: print(f"Error: File '{args.file}' not found.", file=sys.stderr)
         sys.exit(1)
         
-    if not (args.find or args.find_heuristic or args.offset is not None):
+    # Check for argument conflicts
+    if args.until_return and args.size is not None:
+        print("Error: You cannot use both '-s' (size limit) and '-r' (until return) together.", file=sys.stderr)
+        print("Explanation: '-s' explicitly limits output to N lines, while '-r' dynamically reads until a return instruction. Choose one!", file=sys.stderr)
+        sys.exit(1)
+        
+    # Resolve Offset (Either from -e or -o)
+    if args.entry:
+        elf_info = parse_elf_headers(args.file)
+        if not elf_info or elf_info['entry_offset'] is None:
+            print(f"Error: Could not natively parse ELF entry point from '{args.file}'.", file=sys.stderr)
+            sys.exit(1)
+        offset = elf_info['entry_offset']
+    elif args.offset is not None:
+        try:
+            offset = parse_offset(args.offset)
+        except ValueError as e:
+            if not args.quiet: print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        offset = None
+        
+    if not (args.find or args.find_heuristic or offset is not None):
         parser.print_help()
         sys.exit(1)
+
+    disasm_size = args.size if args.size is not None else 1
+    find_limit = float('inf') if args.all else (args.size if args.size is not None else 5)
 
     # ==========================
     # FIND MODE
@@ -206,13 +321,19 @@ def main():
                 if not args.quiet: print("Match not found.")
                 sys.exit(1)
                 
-            for off in offsets:
+            total = len(offsets)
+            show_count = min(total, find_limit)
+            
+            for off in offsets[:show_count]:
                 if args.quiet:
                     print(hex(off))
                 else:
                     print(f"Found at offset {hex(off)}:")
                     print_hexdump(data, off, len(pat))
                     print()
+            
+            if total > show_count and not args.quiet:
+                print(f"... and {total - show_count} more hidden. Use -a/--all to show all, or -s to change limit.")
             sys.exit(0)
             
         if args.find_heuristic:
@@ -227,8 +348,12 @@ def main():
                 if not args.quiet: print("No heuristic matches found.")
                 sys.exit(2)
                 
+            total = len(matches)
+            show_count = min(total, find_limit)
             first = True
-            for m_len, m_off, m_pat in matches:
+            
+            for i in range(show_count):
+                m_len, m_off, m_pat = matches[i]
                 if args.quiet:
                     print(hex(m_off))
                 else:
@@ -239,19 +364,15 @@ def main():
                         print(f"Also found {m_len} bytes at offset {hex(m_off)}: {' '.join(f'{b:02x}' for b in m_pat)}")
                     print_hexdump(data, m_off, m_len)
                     print()
+            
+            if total > show_count and not args.quiet:
+                print(f"... and {total - show_count} more heuristic chunks hidden. Use -a/--all to show all.")
             sys.exit(0)
 
     # ==========================
     # PATCH / DISASSEMBLE MODE
     # ==========================
-    if args.offset is not None:
-        try:
-            offset = parse_offset(args.offset)
-        except ValueError:
-            if not args.quiet: print(f"Error: Invalid offset {args.offset}", file=sys.stderr)
-            sys.exit(1)
-            
-        # Write Patch (Executes before disassemble so you can view the new instructions!)
+    if offset is not None:
         if args.hex:
             try:
                 write_bytes = parse_hex(args.hex)
@@ -274,10 +395,9 @@ def main():
                 if not args.quiet: print(f"Error writing to file: {e}", file=sys.stderr)
                 sys.exit(1)
 
-        # Disassemble
         if args.disassemble:
             if not args.quiet: print(f"Disassembly at {hex(offset)}:")
-            disassemble(args.file, offset, args.size, args.quiet)
+            disassemble(args.file, offset, disasm_size, args.until_return, args.quiet)
 
 if __name__ == '__main__':
     main()

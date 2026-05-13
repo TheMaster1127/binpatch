@@ -8,17 +8,13 @@
 2. [Synopsis](#synopsis)
 3. [Options](#options)
 4. [Hex Input Flexibility](#hex-input-flexibility)
-5. [Heuristic Find (`-fh`) – Advanced Search](#heuristic-find--fh--advanced-search)
-6. [Backup Format](#backup-format)
-7. [Exit Codes](#exit-codes)
-8. [Dependencies](#dependencies)
-9. [Examples](#examples)
-    - [Patching with Backup](#1-patch-at-offset-with-backup)
-    - [Exact Find](#2-exact-find-all-locations)
-    - [Heuristic Find](#3-heuristic-find-largest-substring-match)
-    - [Disassembly](#4-disassemble-at-offset)
-    - [Scripting / Automation](#5-combine-finding-and-patching-scripting)
-10. [License](#license)
+5. [Find Limits & Terminal Flooding](#find-limits--terminal-flooding)
+6. [Heuristic Find (`-fh`) – Advanced Search](#heuristic-find--fh--advanced-search)
+7. [Entry Point & Return Resolution (`-e`, `-r`)](#entry-point--return-resolution--e--r)
+8. [Exit Codes](#exit-codes)
+9. [Dependencies](#dependencies)
+10. [Examples](#examples)
+11. [License](#license)
 
 ---
 
@@ -42,14 +38,18 @@ binpatch <file> [OPTIONS]
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `-o`, `--offset` | OFFSET | Offset in file to patch or disassemble. Accepts decimal (`4395`) or hex (`0x112B`). |
+| `-o`, `--offset` | OFFSET | Offset in file to patch or disassemble. Accepts decimal (`4395`) or hex (`0x112b` or just `112b`). |
+| `-e`, `--entry` | (none) | Automatically parse the ELF file to target the Entry Point (replaces `-o`). |
 | `-h`, `--hex` | HEX_STRING | Hex bytes to write to the file (e.g., `"cb 10 00 00 05"`). |
 | `-b`, `--backup` | (none) | Create a timestamped backup of the file before applying the patch. |
-| `-f`, `--find` | HEX_STRING | Find an exact hex pattern in the file and print an `xxd`-style hex dump of all occurrences. |
-| `-fh`, `--find-heuristic`| HEX_STRING | Find the largest contiguous substring match (heuristic search). Useful when exact offsets have shifted. |
-| `-d`, `--disassemble` | (none) | Disassemble instructions at the given `-o` offset. |
-| `-s`, `--size` | N | Number of instructions to disassemble when using `-d` (default: 1). |
+| `-f`, `--find` | HEX_STRING | Find an exact hex pattern in the file and print an `xxd`-style hex dump of occurrences. |
+| `-fh`, `--find-heuristic`| HEX_STRING | Find the largest contiguous substring match (heuristic search). |
+| `-d`, `--disassemble` | (none) | Disassemble instructions at the target offset (AT&T syntax). |
+| `-s`, `--size` | N | **Dual-purpose:** Number of instructions to disassemble (default: 1), OR max number of find results to display (default: 5). |
+| `-r`, `--return` | (none) | Dynamically disassemble until a return instruction is hit (`ret`, `bx lr`, `pop {pc}`, etc.). Cannot be used with `-s`. |
+| `-a`, `--all` | (none) | Show ALL find results, overriding the `-s` size limit. |
 | `-q`, `--quiet` | (none) | Scripting mode. Suppresses all visual formatting and prints *only* raw hex offsets (`0x...`). |
+| `--version` | (none) | Show version `binpatch 1.0.0`. |
 | `--help` | (none) | Show the help message and exit. |
 
 *(Note: `-h` maps to `--hex`, not help. Use `--help` for the manual).*
@@ -69,6 +69,16 @@ All of these inputs are treated as exactly the same byte sequence:
 
 ---
 
+## Find Limits & Terminal Flooding
+
+To prevent your terminal from exploding when searching for common bytes (like `00 00`), `binpatch` automatically limits find results to the **first 5 matches**. 
+
+If more matches exist, it will hide them and notify you at the bottom of the output. 
+- Use `-a` or `--all` to force it to print every single match.
+- Use `-s N` to change the limit to a specific number (e.g., `-s 20` shows 20 results).
+
+---
+
 ## Heuristic Find (`-fh`) – Advanced Search
 
 If a binary has been slightly updated or recompiled, an exact byte signature might break. The Heuristic Find (`-fh`) solves this by generating all contiguous substrings of your hex pattern and searching for the largest surviving chunks.
@@ -78,22 +88,22 @@ If you search for `"cb 10 00 00 05"`, `binpatch` will attempt to find the full s
 2. `cb 10 00 00` / `10 00 00 05` (4 bytes)
 3. `cb 10 00` / `00 00 05` ... (3 bytes)
 
-It collects all matches across the binary, sorts them by size (largest first), and filters the output to prevent terminal flooding (e.g., ignoring millions of 1-byte `00` matches if a 4-byte match was found).
+---
+
+## Entry Point & Return Resolution (`-e`, `-r`)
+
+`binpatch` contains a native Python ELF parser.
+If you use the `-e` flag instead of `-o`, the tool will automatically resolve the Virtual Address of the entry point, translate it into the exact Raw File Offset, and target it.
+
+If you use `-r` alongside `-d`, `binpatch` streams the disassembly line-by-line and will automatically stop when it hits an architecture-specific return instruction (e.g., `ret` for x86, `bx lr` or `pop {pc}` for ARM, `jr ra` for MIPS). 
 
 ---
 
 ## Backup Format
 
-When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the original file is copied safely before modifications are made. Metadata is preserved.
+When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the original file is copied safely before modifications are made.
 
 **Format:** `backup_YYYYMMDD_HHMMSS_originalfilename`
-
-- `YYYY` – Year
-- `MM` – Month (01–12)
-- `DD` – Day (01–31)
-- `HH` – Hour (00–23, 24-hour)
-- `MM` – Minute (00–59)
-- `SS` – Second (00–59)
 
 *Example:* `backup_20260513_141527_my_program`
 
@@ -104,7 +114,7 @@ When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the 
 | Code | Meaning |
 |------|---------|
 | `0` | Success. |
-| `1` | Error (File not found, invalid offset, hex parsing error, or exact match `-f` not found). |
+| `1` | Error (File not found, invalid offset, conflict, or exact match `-f` not found). |
 | `2` | No match found during heuristic search (`-fh`). |
 
 ---
@@ -118,14 +128,19 @@ When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the 
 
 ## Examples
 
-### 1. Patch at offset with backup
+### 1. Disassemble Entry Point until Return
+Natively resolve the entry point, then disassemble the entire function until the `ret` keyword is hit.
+```bash
+binpatch my_program -e -d -r
+```
+
+### 2. Patch at offset with backup
 Write 5 bytes to offset `0x112B` and create a timestamped backup first.
 ```bash
 binpatch my_program -o 0x112B -h "cb 10 00 00 05" -b
 ```
 
-### 2. Exact find (all locations)
-Search for a byte sequence. `binpatch` generates an independent, `xxd`-style hex dump with `^^` carets highlighting the exact location in memory.
+### 3. Exact find
 ```bash
 binpatch my_program -f "cb 10 00 00 05"
 ```
@@ -136,26 +151,8 @@ Found at offset 0x112b:
                 ^^ ^^ ^^ ^^ ^^ 
 ```
 
-### 3. Heuristic find (Largest substring match)
-Find the largest surviving chunk of a broken byte signature.
-```bash
-binpatch my_program -fh "cb 10 00 00 05"
-```
-*Output:*
-```text
-Largest match: 4 bytes at offset 0x112b
-00001120: 12 34 cb 10 00 00 90 90  00 00 00 00 00 00 00 00  |.4.............|
-                ^^ ^^ ^^ ^^ 
-```
-
-### 4. Disassemble at offset
-Disassemble 10 instructions starting at `0x112B`. If combined with `-h`, it writes the patch *first*, then disassembles so you can instantly verify your injected assembly.
-```bash
-binpatch my_program -o 0x112B -d -s 10
-```
-
-### 5. Combine finding and patching (Scripting)
-Using the `--quiet` (`-q`) flag, `binpatch` outputs *only* raw hexadecimal addresses. This makes it incredibly powerful for bash scripting.
+### 4. Combine finding and patching (Scripting)
+Using the `--quiet` (`-q`) flag, `binpatch` outputs *only* raw hexadecimal addresses. 
 
 *Find a signature, grab the first offset, and overwrite it with NOPs (`90`):*
 ```bash
