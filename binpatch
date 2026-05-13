@@ -121,7 +121,6 @@ def parse_elf_headers(filepath):
             f.seek(18)
             e_machine = struct.unpack(endian + 'H', f.read(2))[0]
             
-            # Map ELF e_machine to objdump architecture names for raw fallback
             arch_map = {
                 3: 'i386',           # EM_386
                 8: 'mips',           # EM_MIPS
@@ -130,7 +129,7 @@ def parse_elf_headers(filepath):
                 62: 'i386:x86-64',   # EM_X86_64
                 183: 'aarch64'       # EM_AARCH64
             }
-            arch = arch_map.get(e_machine, 'i386:x86-64') # Default to x86-64 if unknown
+            arch = arch_map.get(e_machine, 'i386:x86-64')
             
             f.seek(24)
             if ei_class == 1:
@@ -185,29 +184,9 @@ def get_vaddr(elf_info, file_offset):
             return p_vaddr + (file_offset - p_offset)
     return None
 
-def disassemble(filename, offset, size, until_return, quiet):
-    """Disassembles binary at offset using robust streaming."""
-    if not shutil.which('objdump'):
-        if not quiet: print("Error: 'objdump' not found on system. Cannot disassemble.", file=sys.stderr)
-        sys.exit(1)
-    
-    elf_info = parse_elf_headers(filename)
-    vaddr = get_vaddr(elf_info, offset)
-    
-    # Attempt 1: Standard objdump (Uses VMA if mapped)
-    if vaddr is not None:
-        start_addr = vaddr
-        match_addr_int = vaddr
-        cmd = ['objdump', '-D', '-M', 'intel', f'--start-address={start_addr}', filename]
-    else:
-        # Attempt 2: Fallback to Raw Binary Mode with Dynamic Architecture Detection
-        arch = elf_info['arch'] if elf_info else 'i386:x86-64'
-        start_addr = offset
-        match_addr_int = offset
-        cmd = ['objdump', '-D', '-b', 'binary', '-m', arch, '-M', 'intel', f'--start-address={start_addr}', filename]
-
+def run_objdump_stream(cmd, match_addr_int, size, until_return):
+    """Executes objdump and extracts the requested instructions cleanly."""
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
     count = 0
     started = False
     extracted = []
@@ -224,7 +203,6 @@ def disassemble(filename, offset, size, until_return, quiet):
                 parts = line.strip().split(':', 1)
                 if len(parts) >= 1 and ' ' not in parts[0]:
                     try:
-                        # Robust integer comparison (fixes zero-padding bug)
                         if int(parts[0], 16) == match_addr_int:
                             started = True
                     except ValueError:
@@ -244,9 +222,36 @@ def disassemble(filename, offset, size, until_return, quiet):
     finally:
         process.terminate()
         process.wait()
+        
+    return extracted
+
+def disassemble(filename, offset, size, until_return, quiet):
+    """Disassembles binary at offset with robust fallback and smart architecture detection."""
+    if not shutil.which('objdump'):
+        if not quiet: print("Error: 'objdump' not found on system. Cannot disassemble.", file=sys.stderr)
+        sys.exit(1)
     
+    elf_info = parse_elf_headers(filename)
+    vaddr = get_vaddr(elf_info, offset)
+    arch = elf_info['arch'] if elf_info else 'i386:x86-64'
+    
+    # Only use Intel syntax for x86 architectures (prevents ARM/MIPS from crashing objdump)
+    intel_flag = ['-M', 'intel'] if ('i386' in arch or 'x86' in arch) else []
+    
+    extracted = []
+    
+    # Attempt 1: Native ELF parsing (Fails on custom binaries with stripped section headers)
+    if vaddr is not None:
+        cmd1 = ['objdump', '-D'] + intel_flag + [f'--start-address={vaddr}', filename]
+        extracted = run_objdump_stream(cmd1, vaddr, size, until_return)
+        
+    # Attempt 2: Raw Binary Fallback (Guarantees output by slicing raw bytes)
     if not extracted:
-        if not quiet: print(f"Failed to disassemble at offset {hex(offset)}. (No instructions found).")
+        cmd2 = ['objdump', '-D', '-b', 'binary', '-m', arch] + intel_flag + [f'--start-address={offset}', filename]
+        extracted = run_objdump_stream(cmd2, offset, size, until_return)
+        
+    if not extracted:
+        if not quiet: print(f"Failed to disassemble at offset {hex(offset)}. (No instructions found).", file=sys.stderr)
         return
         
     for line in extracted:
