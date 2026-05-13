@@ -1,1 +1,283 @@
-print("hello world")
+#!/usr/bin/env python3
+
+# ==============================================================================
+# binpatch - Binary Patching Tool
+# ------------------------------------------------------------------------------
+# A powerful CLI utility to patch, find, and disassemble bytes in binary files.
+# Features automatic backups, flexible hex parsing, and heuristic chunk finding.
+#
+# Copyright (C) 2026 TheMaster1127 a.k.a. Mr. Compiler
+# Licensed under the GNU General Public License v3.0 (GPLv3)
+# 
+# This program is free software: you can redistribute it and/or modify it under 
+# the terms of the GNU General Public License as published by the Free Software 
+# Foundation, either version 3 of the License, or at your option, any later version.
+# ==============================================================================
+
+import os
+import sys
+import argparse
+import datetime
+import shutil
+import subprocess
+import re
+
+def parse_hex(s):
+    """
+    Parses flexible hex strings into bytes.
+    Accepts: 'cb 10 00 00 05', 'cb10000005', '0xcb, 0x10', etc.
+    """
+    # Lowercase, remove '0x', replace commas with spaces
+    s = s.lower().replace('0x', '').replace(',', ' ')
+    # Strip all whitespace to create a single contiguous hex string
+    s = ''.join(s.split())
+    if len(s) % 2 != 0:
+        raise ValueError("Hex string must have an even number of characters.")
+    return bytes.fromhex(s)
+
+def parse_offset(s):
+    """Parses offset strings, supporting decimal and 0x hex formats."""
+    s = s.strip()
+    if s.lower().startswith('0x'):
+        return int(s, 16)
+    return int(s)
+
+def print_hexdump(data, match_offset, match_len):
+    """
+    Prints an xxd-style hex dump highlighting the matched bytes with '^^'.
+    """
+    start_line = match_offset & ~0xF
+    end_line = (match_offset + match_len - 1) & ~0xF
+
+    for i in range(start_line, end_line + 16, 16):
+        chunk = data[i:i+16]
+        if not chunk: 
+            break
+        
+        hex_str = ''
+        caret_str = ''
+        for j, b in enumerate(chunk):
+            curr = i + j
+            hex_str += f"{b:02x} "
+            if j == 7: hex_str += " " # Middle gap
+            
+            # Place carets under the matched bytes
+            if match_offset <= curr < match_offset + match_len:
+                caret_str += "^^ "
+            else:
+                caret_str += "   "
+            if j == 7: caret_str += " "
+
+        # ASCII representation (dots for non-printable)
+        ascii_str = ''.join(chr(b) if 32 <= b <= 126 else '.' for b in chunk)
+        
+        print(f"{i:08x}: {hex_str:<49} |{ascii_str}|")
+        if "^" in caret_str:
+            print(f"          {caret_str}")
+
+def find_exact(data, pat):
+    """Finds all exact occurrences of a byte pattern."""
+    offsets = []
+    idx = 0
+    while True:
+        idx = data.find(pat, idx)
+        if idx == -1: 
+            break
+        offsets.append(idx)
+        idx += 1
+    return offsets
+
+def find_heuristic(data, pat):
+    """
+    Finds the largest contiguous substrings of the pattern in the data.
+    Generates lengths from len(pat) down to 1, searching all permutations.
+    """
+    matches = []
+    
+    for length in range(len(pat), 0, -1):
+        for start in range(len(pat) - length + 1):
+            subpat = pat[start:start+length]
+            idx = 0
+            while True:
+                idx = data.find(subpat, idx)
+                if idx == -1: 
+                    break
+                
+                # Deduplication: Ensure this match isn't just a subset of a larger match we already found at this exact spot
+                covered = False
+                for (m_len, m_off, _) in matches:
+                    if m_off <= idx <= m_off + m_len - length:
+                        covered = True
+                        break
+                
+                if not covered:
+                    matches.append((length, idx, subpat))
+                idx += 1
+
+    # Sort: Largest length first, then by offset
+    matches.sort(key=lambda x: (-x[0], x[1]))
+    
+    # Smart Filtering: Limit output to prevent terminal flooding
+    if not matches: return []
+    
+    top_len = matches[0][0]
+    # Only keep the top length and top length - 1 (ignores single-byte floods if we found big chunks)
+    allowed_lengths = {top_len, top_len - 1} if top_len > 1 else {1}
+    filtered_matches = [m for m in matches if m[0] in allowed_lengths]
+    
+    return filtered_matches[:20] # Hard cap at 20 results to keep the terminal clean
+
+def disassemble(filename, offset, size, quiet):
+    """Disassembles binary at offset using objdump."""
+    if not shutil.which('objdump'):
+        if not quiet: print("Error: 'objdump' not found on system. Cannot disassemble.", file=sys.stderr)
+        sys.exit(1)
+    
+    stop_addr = offset + (size * 15) # Safely overestimate stop address (x86 max instr is 15 bytes)
+    
+    # Standard attempt
+    cmd = ['objdump', '-d', f'--start-address={offset}', f'--stop-address={stop_addr}', filename]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    
+    # Fallback to raw binary mode if not an ELF/PE file
+    if res.returncode != 0 or 'file format not recognized' in res.stderr:
+        cmd = ['objdump', '-D', '-b', 'binary', '-m', 'i386:x86-64', f'--start-address={offset}', f'--stop-address={stop_addr}', filename]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    lines = res.stdout.splitlines()
+    count = 0
+    started = False
+    offset_hex = f"{offset:x}"
+    
+    for line in lines:
+        if not started:
+            # Look for the exact offset marking the start of instructions, ignoring leading zeros
+            if re.search(r'\b0*' + re.escape(offset_hex) + r':', line.lower()):
+                started = True
+        
+        if started:
+            # Skip empty lines and headers
+            if line.strip() and not line.startswith('Disassembly') and not line.endswith(':'):
+                print(line)
+                count += 1
+                if count >= size:
+                    break
+
+def main():
+    # We use add_help=False so we can map '-h' to '--hex' instead of '--help'
+    parser = argparse.ArgumentParser(description="binpatch - Binary Patching Tool", add_help=False)
+    parser.add_argument('file', help="Target file")
+    parser.add_argument('-o', '--offset', help="Offset in file (decimal or hex with 0x)")
+    parser.add_argument('-h', '--hex', help="Hex bytes to write (e.g., 'cb 10 00 00 05')")
+    parser.add_argument('-b', '--backup', action='store_true', help="Create backup before patching")
+    parser.add_argument('-f', '--find', help="Find exact hex pattern in file")
+    parser.add_argument('-fh', '--find-heuristic', help="Find largest contiguous substring match")
+    parser.add_argument('-d', '--disassemble', action='store_true', help="Disassemble at offset (requires -o)")
+    parser.add_argument('-s', '--size', type=int, default=1, help="Number of instructions to disassemble (default: 1)")
+    parser.add_argument('-q', '--quiet', action='store_true', help="Scripting mode: Output raw offsets only")
+    parser.add_argument('--help', action='help', help="Show this help message and exit")
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.file):
+        if not args.quiet: print(f"Error: File '{args.file}' not found.", file=sys.stderr)
+        sys.exit(1)
+        
+    if not (args.find or args.find_heuristic or args.offset is not None):
+        parser.print_help()
+        sys.exit(1)
+
+    # ==========================
+    # FIND MODE
+    # ==========================
+    if args.find or args.find_heuristic:
+        with open(args.file, 'rb') as f:
+            data = f.read()
+
+        if args.find:
+            try:
+                pat = parse_hex(args.find)
+            except Exception as e:
+                if not args.quiet: print(f"Error parsing hex: {e}", file=sys.stderr)
+                sys.exit(1)
+                
+            offsets = find_exact(data, pat)
+            if not offsets:
+                if not args.quiet: print("Match not found.")
+                sys.exit(1)
+                
+            for off in offsets:
+                if args.quiet:
+                    print(hex(off))
+                else:
+                    print(f"Found at offset {hex(off)}:")
+                    print_hexdump(data, off, len(pat))
+                    print()
+            sys.exit(0)
+            
+        if args.find_heuristic:
+            try:
+                pat = parse_hex(args.find_heuristic)
+            except Exception as e:
+                if not args.quiet: print(f"Error parsing hex: {e}", file=sys.stderr)
+                sys.exit(1)
+                
+            matches = find_heuristic(data, pat)
+            if not matches:
+                if not args.quiet: print("No heuristic matches found.")
+                sys.exit(2)
+                
+            first = True
+            for m_len, m_off, m_pat in matches:
+                if args.quiet:
+                    print(hex(m_off))
+                else:
+                    if first:
+                        print(f"Largest match: {m_len} bytes at offset {hex(m_off)}")
+                        first = False
+                    else:
+                        print(f"Also found {m_len} bytes at offset {hex(m_off)}: {' '.join(f'{b:02x}' for b in m_pat)}")
+                    print_hexdump(data, m_off, m_len)
+                    print()
+            sys.exit(0)
+
+    # ==========================
+    # PATCH / DISASSEMBLE MODE
+    # ==========================
+    if args.offset is not None:
+        try:
+            offset = parse_offset(args.offset)
+        except ValueError:
+            if not args.quiet: print(f"Error: Invalid offset {args.offset}", file=sys.stderr)
+            sys.exit(1)
+            
+        # Write Patch (Executes before disassemble so you can view the new instructions!)
+        if args.hex:
+            try:
+                write_bytes = parse_hex(args.hex)
+            except Exception as e:
+                if not args.quiet: print(f"Error parsing hex: {e}", file=sys.stderr)
+                sys.exit(1)
+                
+            if args.backup:
+                ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_name = f"backup_{ts}_{os.path.basename(args.file)}"
+                shutil.copy2(args.file, backup_name)
+                if not args.quiet: print(f"Backup created: {backup_name}")
+                
+            try:
+                with open(args.file, 'r+b') as f:
+                    f.seek(offset)
+                    f.write(write_bytes)
+                if not args.quiet: print(f"Successfully wrote {len(write_bytes)} bytes at offset {hex(offset)}.\n")
+            except Exception as e:
+                if not args.quiet: print(f"Error writing to file: {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Disassemble
+        if args.disassemble:
+            if not args.quiet: print(f"Disassembly at {hex(offset)}:")
+            disassemble(args.file, offset, args.size, args.quiet)
+
+if __name__ == '__main__':
+    main()
