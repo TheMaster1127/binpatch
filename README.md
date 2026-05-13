@@ -38,13 +38,13 @@ binpatch <file> [OPTIONS]
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `-o`, `--offset` | OFFSET | Offset in file to patch or disassemble. Accepts decimal (`4395`) or hex (`0x112b` or just `112b`). |
+| `-o`, `--offset` | OFFSET | Offset in file to patch or disassemble. **All offsets are treated as Hexadecimal** (e.g., `112b` or `0x112b`). |
 | `-e`, `--entry` | (none) | Automatically parse the ELF file to target the Entry Point (replaces `-o`). |
 | `-h`, `--hex` | HEX_STRING | Hex bytes to write to the file (e.g., `"cb 10 00 00 05"`). |
 | `-b`, `--backup` | (none) | Create a timestamped backup of the file before applying the patch. |
 | `-f`, `--find` | HEX_STRING | Find an exact hex pattern in the file and print an `xxd`-style hex dump of occurrences. |
 | `-fh`, `--find-heuristic`| HEX_STRING | Find the largest contiguous substring match (heuristic search). |
-| `-d`, `--disassemble` | (none) | Disassemble instructions at the target offset (AT&T syntax). |
+| `-d`, `--disassemble` | (none) | Disassemble instructions at the target offset (Outputs in **Intel syntax**). |
 | `-s`, `--size` | N | **Dual-purpose:** Number of instructions to disassemble (default: 1), OR max number of find results to display (default: 5). |
 | `-r`, `--return` | (none) | Dynamically disassemble until a return instruction is hit (`ret`, `bx lr`, `pop {pc}`, etc.). Cannot be used with `-s`. |
 | `-a`, `--all` | (none) | Show ALL find results, overriding the `-s` size limit. |
@@ -114,8 +114,7 @@ When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the 
 | Code | Meaning |
 |------|---------|
 | `0` | Success. |
-| `1` | Error (File not found, invalid offset, conflict, or exact match `-f` not found). |
-| `2` | No match found during heuristic search (`-fh`). |
+| `1` | Error (File not found, invalid offset, conflict, or match not found). |
 
 ---
 
@@ -137,7 +136,7 @@ binpatch my_program -e -d -r
 ### 2. Patch at offset with backup
 Write 5 bytes to offset `0x112B` and create a timestamped backup first.
 ```bash
-binpatch my_program -o 0x112B -h "cb 10 00 00 05" -b
+binpatch my_program -o 112B -h "cb 10 00 00 05" -b
 ```
 
 ### 3. Exact find
