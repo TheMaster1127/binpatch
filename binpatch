@@ -279,7 +279,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="binpatch - Binary Patching Tool", add_help=False)
     parser.add_argument('file', help="Target file")
-    parser.add_argument('-o', '--offset', help="Raw File Offset (Hexadecimal). Do not use VMAs here.")
+    parser.add_argument('-o', '--offset', help="Raw File Offset (Hexadecimal).")
+    parser.add_argument('-va', '--vaddr', help="Virtual Address (Hexadecimal). Auto-translates to File Offset.")
     parser.add_argument('-e', '--entry', action='store_true', help="Target the ELF Entry Point (_start)")
     parser.add_argument('-m', '--main', action='store_true', help="Target the true 'main()' function (C/C++ binaries)")
     parser.add_argument('-h', '--hex', help="Hex bytes to write (e.g., 'cb 10 00 00 05')")
@@ -288,7 +289,7 @@ def main():
     parser.add_argument('-fh', '--find-heuristic', help="Find largest contiguous substring match")
     parser.add_argument('-d', '--disassemble', action='store_true', help="Disassemble at target offset")
     parser.add_argument('-s', '--size', type=int, default=None, help="Num instructions OR Num find results (Defaults: 1 for disasm, 5 for find)")
-    parser.add_argument('-r', '--return', action='store_true', dest='until_return', help="Disassemble until return instruction")
+    parser.add_argument('-r', '--return', action='store_true', dest='until_return', help="Disassemble until return instruction (ret, bx lr, etc.)")
     parser.add_argument('-a', '--all', action='store_true', help="Show all find results (Overrides limit)")
     parser.add_argument('-q', '--quiet', action='store_true', help="Scripting mode: Output raw offsets only")
     parser.add_argument('--help', action='help', help="Show this help message and exit")
@@ -304,7 +305,7 @@ def main():
         print("Error: You cannot use both '-s' (size limit) and '-r' (until return) together.", file=sys.stderr)
         sys.exit(1)
         
-    # Resolve Offset strictly (No VMA Guessing)
+    # Resolve Offset strictly
     if args.main:
         main_vma = resolve_main_vaddr(args.file)
         if main_vma is None:
@@ -338,6 +339,32 @@ def main():
         if not args.quiet:
             print(f"[*] Found Entry Point at File Offset {hex(elf_info['entry_offset'])}")
         offset = elf_info['entry_offset']
+
+    elif args.vaddr is not None:
+        try:
+            vaddr = parse_offset(args.vaddr)
+        except ValueError as e:
+            if not args.quiet: print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+            
+        elf_info = parse_elf_headers(args.file)
+        if not elf_info:
+            print(f"Error: Cannot translate Virtual Address {hex(vaddr)} because {args.file} is not a valid ELF.", file=sys.stderr)
+            sys.exit(1)
+            
+        translated = None
+        for p_offset, p_filesz, p_vaddr in elf_info['segments']:
+            if p_vaddr <= vaddr < p_vaddr + p_filesz:
+                translated = p_offset + (vaddr - p_vaddr)
+                break
+                
+        if translated is None:
+            print(f"Error: Virtual Address {hex(vaddr)} is not mapped in the physical file.", file=sys.stderr)
+            sys.exit(1)
+            
+        if not args.quiet:
+            print(f"[*] Mapped Virtual Address {hex(vaddr)} -> File Offset {hex(translated)}")
+        offset = translated
         
     elif args.offset is not None:
         try:

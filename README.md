@@ -7,7 +7,7 @@
 1. [Introduction](#introduction)
 2. [Synopsis](#synopsis)
 3. [Options](#options)
-4. [File Offsets vs. Virtual Addresses](#file-offsets-vs-virtual-addresses)
+4. [File Offsets vs. Virtual Addresses (`-o` vs `-va`)](#file-offsets-vs-virtual-addresses--o-vs--va)
 5. [Hex Input Flexibility](#hex-input-flexibility)
 6. [Find Limits & Terminal Flooding](#find-limits--terminal-flooding)
 7. [Heuristic Find (`-fh`) – Advanced Search](#heuristic-find--fh--advanced-search)
@@ -39,7 +39,8 @@ binpatch <file> [OPTIONS]
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `-o`, `--offset` | OFFSET | **Raw File Offset** to patch or disassemble. All inputs treated as Hex (`112b` or `0x112b`). |
+| `-o`, `--offset` | OFFSET | **Raw File Offset** to patch or disassemble. (e.g., `112b` or `0x112b`). |
+| `-va`, `--vaddr` | VMA | **Virtual Memory Address** (from `objdump`/IDA). Auto-translates to the correct File Offset. |
 | `-e`, `--entry` | (none) | Automatically parse the ELF file to target the Entry Point (`_start`). Replaces `-o`. |
 | `-m`, `--main` | (none) | Automatically target the `main()` function in compiled C/C++ binaries. Replaces `-o`. |
 | `-h`, `--hex` | HEX_STRING | Hex bytes to write to the file (e.g., `"cb 10 00 00 05"`). |
@@ -58,12 +59,12 @@ binpatch <file> [OPTIONS]
 
 ---
 
-## File Offsets vs. Virtual Addresses
+## File Offsets vs. Virtual Addresses (`-o` vs `-va`)
 
-**Warning:** The `-o` flag expects a **Raw Physical File Offset**, exactly as it exists on your hard drive. 
-If you copy a Virtual Address (VMA) from `objdump`, `Ghidra`, or `IDA Pro` (e.g., `0x4011e0`), it will likely point to the wrong physical location in the file due to memory page alignment. 
+Reverse engineers often copy addresses from `objdump`, `Ghidra`, or `IDA Pro`. These tools output **Virtual Memory Addresses (VMAs)** (e.g. `0x4011e0`), whereas a file on a hard drive is accessed via **File Offsets** (e.g. `0x11e0`).
 
-If you want to find where a Virtual Address physically lives, use `-f` to search for the bytes, and use the raw offset that `binpatch` returns to you.
+- If you have an exact File Offset from `-f` (Find), use **`-o`**.
+- If you copy a memory address directly from disassembly output, use **`-va`**. `binpatch` will natively parse the ELF header and map it perfectly to the correct physical File Offset before patching.
 
 ---
 
@@ -137,27 +138,26 @@ When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the 
 
 ## Examples
 
-### 1. Disassemble the `main()` function
-Automatically resolve the `main()` symbol and disassemble the entire function until it returns.
+### 1. NOP out a Jump Instruction (Game Hacking)
+Copy the Virtual Address of the instruction straight from IDA Pro or `objdump`, translate it safely with `-va`, and overwrite it with NOPs (`90 90`).
 ```bash
-binpatch my_program -m -d -r
+binpatch c_binary -va 4011cd -h "90 90"
 ```
 
-### 2. Patch at offset with backup
-Write 5 bytes to offset `0x112B` and create a timestamped backup first.
+### 2. Disassemble the `main()` function
+Automatically resolve the `main()` symbol and disassemble the entire function until it returns.
+```bash
+binpatch c_binary -m -d -r
+```
+
+### 3. Patch at raw offset with backup
+Write 5 bytes to file offset `0x112B` and create a timestamped backup first.
 ```bash
 binpatch my_program -o 112B -h "cb 10 00 00 05" -b
 ```
 
-### 3. Exact find
-```bash
-binpatch my_program -f "cb 10 00 00 05"
-```
-
 ### 4. Combine finding and patching (Scripting)
 Using the `--quiet` (`-q`) flag, `binpatch` outputs *only* raw hexadecimal addresses. 
-
-*Find a signature, grab the first offset, and overwrite it with NOPs (`90`):*
 ```bash
 OFFSET=$(binpatch my_program -f "cb 10 00 00 05" -q | head -1)
 binpatch my_program -o $OFFSET -h "90 90 90 90 90" -b
