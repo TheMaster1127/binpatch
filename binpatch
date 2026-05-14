@@ -191,7 +191,6 @@ def resolve_main_vaddr(filename):
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         for line in res.stdout.splitlines():
-            # Looks for: "0000000000401166 g     F .text  000000000000008a              main"
             if line.endswith(' main') or line.endswith('\tmain'):
                 parts = line.split()
                 if len(parts) > 0:
@@ -280,8 +279,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="binpatch - Binary Patching Tool", add_help=False)
     parser.add_argument('file', help="Target file")
-    parser.add_argument('-o', '--offset', help="File Offset (Hexadecimal). Auto-translates VMAs.")
-    parser.add_argument('-va', '--vaddr', help="Virtual Address (e.g. 401080). Translates to File Offset.")
+    parser.add_argument('-o', '--offset', help="Raw File Offset (Hexadecimal). Do not use VMAs here.")
     parser.add_argument('-e', '--entry', action='store_true', help="Target the ELF Entry Point (_start)")
     parser.add_argument('-m', '--main', action='store_true', help="Target the true 'main()' function (C/C++ binaries)")
     parser.add_argument('-h', '--hex', help="Hex bytes to write (e.g., 'cb 10 00 00 05')")
@@ -306,7 +304,7 @@ def main():
         print("Error: You cannot use both '-s' (size limit) and '-r' (until return) together.", file=sys.stderr)
         sys.exit(1)
         
-    # Resolve Offset
+    # Resolve Offset strictly (No VMA Guessing)
     if args.main:
         main_vma = resolve_main_vaddr(args.file)
         if main_vma is None:
@@ -340,32 +338,6 @@ def main():
         if not args.quiet:
             print(f"[*] Found Entry Point at File Offset {hex(elf_info['entry_offset'])}")
         offset = elf_info['entry_offset']
-
-    elif args.vaddr is not None:
-        try:
-            vaddr = parse_offset(args.vaddr)
-        except ValueError as e:
-            if not args.quiet: print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-            
-        elf_info = parse_elf_headers(args.file)
-        if not elf_info:
-            print(f"Error: Cannot translate Virtual Address {hex(vaddr)} because {args.file} is not a valid ELF.", file=sys.stderr)
-            sys.exit(1)
-            
-        translated = None
-        for p_offset, p_filesz, p_vaddr in elf_info['segments']:
-            if p_vaddr <= vaddr < p_vaddr + p_filesz:
-                translated = p_offset + (vaddr - p_vaddr)
-                break
-                
-        if translated is None:
-            print(f"Error: Virtual Address {hex(vaddr)} is not mapped in the physical file.", file=sys.stderr)
-            sys.exit(1)
-            
-        if not args.quiet:
-            print(f"[*] Mapped Virtual Address {hex(vaddr)} -> File Offset {hex(translated)}")
-        offset = translated
         
     elif args.offset is not None:
         try:
@@ -373,18 +345,6 @@ def main():
         except ValueError as e:
             if not args.quiet: print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-            
-        file_size = os.path.getsize(args.file)
-        if offset >= file_size:
-            elf_info = parse_elf_headers(args.file)
-            if elf_info:
-                for p_offset, p_filesz, p_vaddr in elf_info['segments']:
-                    if p_vaddr <= offset < p_vaddr + p_filesz:
-                        translated = p_offset + (offset - p_vaddr)
-                        if not args.quiet:
-                            print(f"[*] Auto-translated VMA {hex(offset)} -> File Offset {hex(translated)}")
-                        offset = translated
-                        break
     else:
         offset = None
         

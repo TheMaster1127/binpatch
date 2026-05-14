@@ -7,7 +7,7 @@
 1. [Introduction](#introduction)
 2. [Synopsis](#synopsis)
 3. [Options](#options)
-4. [File Offsets vs. Virtual Addresses (VMA Magic)](#file-offsets-vs-virtual-addresses-vma-magic)
+4. [File Offsets vs. Virtual Addresses](#file-offsets-vs-virtual-addresses)
 5. [Hex Input Flexibility](#hex-input-flexibility)
 6. [Find Limits & Terminal Flooding](#find-limits--terminal-flooding)
 7. [Heuristic Find (`-fh`) – Advanced Search](#heuristic-find--fh--advanced-search)
@@ -39,8 +39,7 @@ binpatch <file> [OPTIONS]
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `-o`, `--offset` | OFFSET | File Offset to patch or disassemble. **Auto-translates VMAs** if input exceeds file size. All inputs treated as Hex. |
-| `-va`, `--vaddr` | VMA | Explicitly provide a Virtual Address (e.g. from IDA Pro/objdump). Auto-translates to physical file offset. |
+| `-o`, `--offset` | OFFSET | **Raw File Offset** to patch or disassemble. All inputs treated as Hex (`112b` or `0x112b`). |
 | `-e`, `--entry` | (none) | Automatically parse the ELF file to target the Entry Point (`_start`). Replaces `-o`. |
 | `-m`, `--main` | (none) | Automatically target the `main()` function in compiled C/C++ binaries. Replaces `-o`. |
 | `-h`, `--hex` | HEX_STRING | Hex bytes to write to the file (e.g., `"cb 10 00 00 05"`). |
@@ -59,13 +58,12 @@ binpatch <file> [OPTIONS]
 
 ---
 
-## File Offsets vs. Virtual Addresses (VMA Magic)
+## File Offsets vs. Virtual Addresses
 
-Reverse engineers often copy addresses from `objdump`, `Ghidra`, or `IDA Pro`. These tools output **Virtual Memory Addresses (VMAs)** (e.g. `0x401080`), whereas hex editors expect physical **File Offsets** (e.g. `0x1080`).
+**Warning:** The `-o` flag expects a **Raw Physical File Offset**, exactly as it exists on your hard drive. 
+If you copy a Virtual Address (VMA) from `objdump`, `Ghidra`, or `IDA Pro` (e.g., `0x4011e0`), it will likely point to the wrong physical location in the file due to memory page alignment. 
 
-`binpatch` solves this frustration in two ways:
-1. **The `-va` Flag:** Use `-va 401080` to explicitly tell `binpatch` you are providing a VMA. It will natively parse the ELF header and map it to the correct File Offset.
-2. **The Magic `-o`:** If you accidentally pass a VMA to `-o` (e.g. `-o 401080`), `binpatch` will notice the address is larger than the file size, silently translate the VMA to a physical File Offset, and successfully disassemble or patch the correct bytes.
+If you want to find where a Virtual Address physically lives, use `-f` to search for the bytes, and use the raw offset that `binpatch` returns to you.
 
 ---
 
@@ -145,16 +143,15 @@ Automatically resolve the `main()` symbol and disassemble the entire function un
 binpatch my_program -m -d -r
 ```
 
-### 2. Disassemble via Virtual Address
-Use an address directly from `objdump` or IDA Pro.
-```bash
-binpatch my_program -va 401080 -d -s 15
-```
-
-### 3. Patch at offset with backup
+### 2. Patch at offset with backup
 Write 5 bytes to offset `0x112B` and create a timestamped backup first.
 ```bash
 binpatch my_program -o 112B -h "cb 10 00 00 05" -b
+```
+
+### 3. Exact find
+```bash
+binpatch my_program -f "cb 10 00 00 05"
 ```
 
 ### 4. Combine finding and patching (Scripting)
