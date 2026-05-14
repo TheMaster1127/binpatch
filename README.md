@@ -7,14 +7,15 @@
 1. [Introduction](#introduction)
 2. [Synopsis](#synopsis)
 3. [Options](#options)
-4. [Hex Input Flexibility](#hex-input-flexibility)
-5. [Find Limits & Terminal Flooding](#find-limits--terminal-flooding)
-6. [Heuristic Find (`-fh`) – Advanced Search](#heuristic-find--fh--advanced-search)
-7. [Entry Point & Return Resolution (`-e`, `-r`)](#entry-point--return-resolution--e--r)
-8. [Exit Codes](#exit-codes)
-9. [Dependencies](#dependencies)
-10. [Examples](#examples)
-11. [License](#license)
+4. [File Offsets vs. Virtual Addresses (VMA Magic)](#file-offsets-vs-virtual-addresses-vma-magic)
+5. [Hex Input Flexibility](#hex-input-flexibility)
+6. [Find Limits & Terminal Flooding](#find-limits--terminal-flooding)
+7. [Heuristic Find (`-fh`) – Advanced Search](#heuristic-find--fh--advanced-search)
+8. [Entry Point & Main Resolution (`-e`, `-m`, `-r`)](#entry-point--main-resolution--e--m--r)
+9. [Exit Codes](#exit-codes)
+10. [Dependencies](#dependencies)
+11. [Examples](#examples)
+12. [License](#license)
 
 ---
 
@@ -38,13 +39,15 @@ binpatch <file> [OPTIONS]
 
 | Option | Argument | Description |
 |--------|----------|-------------|
-| `-o`, `--offset` | OFFSET | Offset in file to patch or disassemble. **All offsets are treated as Hexadecimal** (e.g., `112b` or `0x112b`). |
-| `-e`, `--entry` | (none) | Automatically parse the ELF file to target the Entry Point (replaces `-o`). |
+| `-o`, `--offset` | OFFSET | File Offset to patch or disassemble. **Auto-translates VMAs** if input exceeds file size. All inputs treated as Hex. |
+| `-va`, `--vaddr` | VMA | Explicitly provide a Virtual Address (e.g. from IDA Pro/objdump). Auto-translates to physical file offset. |
+| `-e`, `--entry` | (none) | Automatically parse the ELF file to target the Entry Point (`_start`). Replaces `-o`. |
+| `-m`, `--main` | (none) | Automatically target the `main()` function in compiled C/C++ binaries. Replaces `-o`. |
 | `-h`, `--hex` | HEX_STRING | Hex bytes to write to the file (e.g., `"cb 10 00 00 05"`). |
 | `-b`, `--backup` | (none) | Create a timestamped backup of the file before applying the patch. |
 | `-f`, `--find` | HEX_STRING | Find an exact hex pattern in the file and print an `xxd`-style hex dump of occurrences. |
 | `-fh`, `--find-heuristic`| HEX_STRING | Find the largest contiguous substring match (heuristic search). |
-| `-d`, `--disassemble` | (none) | Disassemble instructions at the target offset (Outputs in **Intel syntax**). |
+| `-d`, `--disassemble` | (none) | Disassemble instructions at the target offset (Intel syntax for x86/AMD64). |
 | `-s`, `--size` | N | **Dual-purpose:** Number of instructions to disassemble (default: 1), OR max number of find results to display (default: 5). |
 | `-r`, `--return` | (none) | Dynamically disassemble until a return instruction is hit (`ret`, `bx lr`, `pop {pc}`, etc.). Cannot be used with `-s`. |
 | `-a`, `--all` | (none) | Show ALL find results, overriding the `-s` size limit. |
@@ -53,6 +56,16 @@ binpatch <file> [OPTIONS]
 | `--help` | (none) | Show the help message and exit. |
 
 *(Note: `-h` maps to `--hex`, not help. Use `--help` for the manual).*
+
+---
+
+## File Offsets vs. Virtual Addresses (VMA Magic)
+
+Reverse engineers often copy addresses from `objdump`, `Ghidra`, or `IDA Pro`. These tools output **Virtual Memory Addresses (VMAs)** (e.g. `0x401080`), whereas hex editors expect physical **File Offsets** (e.g. `0x1080`).
+
+`binpatch` solves this frustration in two ways:
+1. **The `-va` Flag:** Use `-va 401080` to explicitly tell `binpatch` you are providing a VMA. It will natively parse the ELF header and map it to the correct File Offset.
+2. **The Magic `-o`:** If you accidentally pass a VMA to `-o` (e.g. `-o 401080`), `binpatch` will notice the address is larger than the file size, silently translate the VMA to a physical File Offset, and successfully disassemble or patch the correct bytes.
 
 ---
 
@@ -83,17 +96,16 @@ If more matches exist, it will hide them and notify you at the bottom of the out
 
 If a binary has been slightly updated or recompiled, an exact byte signature might break. The Heuristic Find (`-fh`) solves this by generating all contiguous substrings of your hex pattern and searching for the largest surviving chunks.
 
-If you search for `"cb 10 00 00 05"`, `binpatch` will attempt to find the full string. If it fails, it recursively slices it down, checking:
-1. `cb 10 00 00 05` (5 bytes)
-2. `cb 10 00 00` / `10 00 00 05` (4 bytes)
-3. `cb 10 00` / `00 00 05` ... (3 bytes)
+*(Note: Due to the substring search method, you may see adjacent overlapping matches. This is normal for a heuristic approach).*
 
 ---
 
-## Entry Point & Return Resolution (`-e`, `-r`)
+## Entry Point & Main Resolution (`-e`, `-m`, `-r`)
 
-`binpatch` contains a native Python ELF parser.
-If you use the `-e` flag instead of `-o`, the tool will automatically resolve the Virtual Address of the entry point, translate it into the exact Raw File Offset, and target it.
+`binpatch` contains advanced structural resolution for ELF binaries.
+
+- **`-e` (Entry Point):** Natively parses the ELF header to resolve the Virtual Address of `_start`, translates it to a physical file offset, and targets it.
+- **`-m` (Main):** Uses `objdump` to scan the binary's symbol table for the `main()` function, translating it to the physical file offset automatically. *(Fails gracefully on stripped binaries).*
 
 If you use `-r` alongside `-d`, `binpatch` streams the disassembly line-by-line and will automatically stop when it hits an architecture-specific return instruction (e.g., `ret` for x86, `bx lr` or `pop {pc}` for ARM, `jr ra` for MIPS). 
 
@@ -121,33 +133,28 @@ When the `-b` (`--backup`) flag is used alongside a write operation (`-h`), the 
 ## Dependencies
 
 - **Python 3.6+** (Uses standard library only; no `pip` installs required).
-- **`objdump`** (Optional). Required only if you use the `-d` (disassemble) flag. Usually installed by default on Linux via `binutils`.
+- **`objdump`** (Optional). Required only if you use the `-d` (disassemble) or `-m` (main) flags. Usually installed by default on Linux via `binutils`.
 
 ---
 
 ## Examples
 
-### 1. Disassemble Entry Point until Return
-Natively resolve the entry point, then disassemble the entire function until the `ret` keyword is hit.
+### 1. Disassemble the `main()` function
+Automatically resolve the `main()` symbol and disassemble the entire function until it returns.
 ```bash
-binpatch my_program -e -d -r
+binpatch my_program -m -d -r
 ```
 
-### 2. Patch at offset with backup
+### 2. Disassemble via Virtual Address
+Use an address directly from `objdump` or IDA Pro.
+```bash
+binpatch my_program -va 401080 -d -s 15
+```
+
+### 3. Patch at offset with backup
 Write 5 bytes to offset `0x112B` and create a timestamped backup first.
 ```bash
 binpatch my_program -o 112B -h "cb 10 00 00 05" -b
-```
-
-### 3. Exact find
-```bash
-binpatch my_program -f "cb 10 00 00 05"
-```
-*Output:*
-```text
-Found at offset 0x112b:
-00001120: 12 34 cb 10 00 00 05 90  00 00 00 00 00 00 00 00  |.4.............|
-                ^^ ^^ ^^ ^^ ^^ 
 ```
 
 ### 4. Combine finding and patching (Scripting)
